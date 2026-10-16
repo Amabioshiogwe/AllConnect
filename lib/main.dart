@@ -3,8 +3,30 @@
 
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'firebase_options.dart';
+import 'package:livekit_client/livekit_client.dart' as lk;
+import 'dart:convert' as conv;
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:webview_flutter/webview_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'paystack_web.dart';
 
-void main() => runApp(const AllConnectApp());
+// Last Paystack reference (set when payment opened)
+String _lastPaystackRef = '';
+
+// Paystack Configuration
+const String PAYSTACK_PUBLIC_KEY = 'pk_test_7325eb7b5a083f4f9b2a427577d9573b6ad4692b';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+  runApp(const AllConnectApp());
+}
 
 class AllConnectApp extends StatelessWidget {
   const AllConnectApp({super.key});
@@ -77,6 +99,410 @@ class _SplashScreenState extends State<SplashScreen> {
   }
 }
 
+
+
+// ==================== LIVEKIT SERVICE ====================
+class LiveKitService {
+  static const String tokenServerUrl = "https://allconnect-token-server.onrender.com";
+  static const String defaultRoom = "allconnect-main";
+
+  lk.Room? room;
+  bool isConnected = false;
+  String connectionStatus = "Not connected";
+  Function? onUpdate;
+
+  Future<String?> _fetchToken(String identity) async {
+    try {
+      final url = Uri.parse("$tokenServerUrl/token?room=$defaultRoom&identity=$identity");
+      final response = await http.get(url).timeout(const Duration(seconds: 60));
+      if (response.statusCode == 200) {
+        final data = conv.json.decode(response.body);
+        return data["token"] as String?;
+      }
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  Future<bool> connect(String identity) async {
+    connectionStatus = "Fetching token...";
+    onUpdate?.call();
+    final token = await _fetchToken(identity);
+    if (token == null) {
+      connectionStatus = "Failed to get token";
+      onUpdate?.call();
+      return false;
+    }
+    connectionStatus = "Connecting to room...";
+    onUpdate?.call();
+    try {
+      room = lk.Room();
+      await room!.connect(
+        "wss://allconnect-6rd2ve3b.livekit.cloud",
+        token,
+      );
+      isConnected = true;
+      connectionStatus = "Connected - enabling camera...";
+      onUpdate?.call();
+      try {
+        final lp = room!.localParticipant;
+        if (lp != null) {
+          await lp.setCameraEnabled(true);
+          await lp.setMicrophoneEnabled(true);
+        }
+        connectionStatus = "Camera ON";
+      } catch (e) {
+        connectionStatus = "Camera error: " + e.toString();
+      }
+      room!.addListener(() => onUpdate?.call());
+      onUpdate?.call();
+      return true;
+    } catch (e) {
+      connectionStatus = "Connection failed: " + e.toString();
+      onUpdate?.call();
+      return false;
+    }
+  }
+
+  Future<void> disconnect() async {
+    await room?.disconnect();
+    await room?.dispose();
+    room = null;
+    isConnected = false;
+    connectionStatus = "Disconnected";
+    onUpdate?.call();
+  }
+}
+
+
+
+// ==================== COINS STORE ====================
+class CoinsStoreScreen extends StatefulWidget {
+  final Function(int) onCoinsPurchased;
+  const CoinsStoreScreen({super.key, required this.onCoinsPurchased});
+
+  @override
+  State<CoinsStoreScreen> createState() => _CoinsStoreScreenState();
+}
+
+class _CoinsStoreScreenState extends State<CoinsStoreScreen> {
+  final List<Map<String, dynamic>> packages = [
+    {'coins': 100, 'naira': 500, 'label': 'Starter', 'popular': false},
+    {'coins': 500, 'naira': 2200, 'label': 'Popular', 'popular': true},
+    {'coins': 1000, 'naira': 4000, 'label': 'Best Value', 'popular': false},
+    {'coins': 5000, 'naira': 18000, 'label': 'Mega Pack', 'popular': false},
+  ];
+
+  void _buyPackage(Map<String, dynamic> pkg) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Confirm Purchase'),
+        content: Text(
+          'Buy ${pkg['coins']} coins for N${pkg['naira']}?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF2E7D32),
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () {
+              Navigator.pop(ctx);
+              final ref = 'AC-' + DateTime.now().millisecondsSinceEpoch.toString();
+              _lastPaystackRef = ref;
+              _lastPaystackRef = ref;
+              paystackPayWeb(
+                publicKey: PAYSTACK_PUBLIC_KEY,
+                email: 'amabioshiogwe@gmail.com',
+                amountKobo: (pkg['naira'] as int) * 100,
+                reference: ref,
+                onSuccess: (reference) {
+                  widget.onCoinsPurchased(pkg['coins'] as int);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Payment successful! Reference: ' + reference)),
+                  );
+                },
+                onError: (error) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Payment cancelled: ' + error)),
+                  );
+                },
+                onVerify: (reference) async {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Verifying: ' + reference)),
+                  );
+                  try {
+                    final r = await http.get(
+                      Uri.parse('https://allconnect-token-server.onrender.com/paystack/verify/' + reference),
+                    ).timeout(const Duration(seconds: 60));
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Server said: ' + r.body)),
+                    );
+                    if (r.statusCode == 200) {
+                      final data = conv.json.decode(r.body);
+                      return data['verified'] == true;
+                    }
+                  } catch (e) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Verify error: ' + e.toString())),
+                    );
+                  }
+                  return false;
+                },
+              );
+            },
+            child: const Text('Pay Now'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Buy Coins'),
+        backgroundColor: const Color(0xFF2E7D32),
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Choose a package',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            ...packages.map((pkg) {
+              final isPopular = pkg['popular'] as bool;
+              return Card(
+                margin: const EdgeInsets.only(bottom: 12),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  side: isPopular
+                      ? const BorderSide(color: Color(0xFFFFC107), width: 2)
+                      : BorderSide.none,
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Row(
+                    children: [
+                      Container(
+                        width: 56,
+                        height: 56,
+                        decoration: const BoxDecoration(
+                          color: Color(0xFFFFC107),
+                          shape: BoxShape.circle,
+                        ),
+                        child: Center(
+                          child: Text(
+                            '${pkg['coins']}',
+                            style: const TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.black,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 14),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text('${pkg['coins']} coins',
+                                style: const TextStyle(
+                                    fontSize: 16, fontWeight: FontWeight.bold)),
+                            const SizedBox(height: 4),
+                            Text(pkg['label'] as String,
+                                style: TextStyle(
+                                    color: isPopular
+                                        ? const Color(0xFF2E7D32)
+                                        : Colors.grey,
+                                    fontSize: 12,
+                                    fontWeight: isPopular
+                                        ? FontWeight.bold
+                                        : FontWeight.normal)),
+                          ],
+                        ),
+                      ),
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          Text('N${pkg['naira']}',
+                              style: const TextStyle(
+                                  fontSize: 16, fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 6),
+                          ElevatedButton(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF2E7D32),
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 16, vertical: 6),
+                            ),
+                            onPressed: () => _buyPackage(pkg),
+                            child: const Text('Buy'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }).toList(),
+            const SizedBox(height: 20),
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: Colors.grey.shade100,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: const Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('How coins work:',
+                      style: TextStyle(fontWeight: FontWeight.bold)),
+                  SizedBox(height: 6),
+                  Text('1. Buy coins with real money (Paystack)', style: TextStyle(fontSize: 12)),
+                  Text('2. Send gifts during video calls', style: TextStyle(fontSize: 12)),
+                  Text('3. Gift receivers earn a percentage', style: TextStyle(fontSize: 12)),
+                  Text('4. Withdraw earnings to your bank', style: TextStyle(fontSize: 12)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+
+
+// ==================== PAYSTACK CHECKOUT ====================
+class PaystackCheckoutScreen extends StatefulWidget {
+  final String email;
+  final int amountNaira;
+  final int coins;
+  final String userName;
+  const PaystackCheckoutScreen({
+    super.key,
+    required this.email,
+    required this.amountNaira,
+    required this.coins,
+    required this.userName,
+  });
+
+  @override
+  State<PaystackCheckoutScreen> createState() => _PaystackCheckoutScreenState();
+}
+
+class _PaystackCheckoutScreenState extends State<PaystackCheckoutScreen> {
+  late final WebViewController _controller;
+  bool _paymentSuccess = false;
+  final String _reference =
+      'AC-' + DateTime.now().millisecondsSinceEpoch.toString();
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onPageFinished: (url) {
+            if (url.contains('success') || url.contains('callback') || url.contains('paystack.com/close')) {
+              setState(() => _paymentSuccess = true);
+            }
+          },
+        ),
+      );
+    _initPayment();
+  }
+
+  Future<void> _initPayment() async {
+    try {
+      final response = await http.post(
+        Uri.parse('https://allconnect-token-server.onrender.com/paystack/init'),
+        headers: {'Content-Type': 'application/json'},
+        body: conv.json.encode({
+          'email': widget.email,
+          'amount': widget.amountNaira,
+          'reference': _reference,
+        }),
+      ).timeout(const Duration(seconds: 60));
+      if (response.statusCode == 200) {
+        final data = conv.json.decode(response.body);
+        final url = data['checkout_url'] as String?;
+        final serverRef = data['reference'] as String?;
+        if (serverRef != null) {
+          _lastPaystackRef = serverRef;
+        }
+        if (url != null) {
+          try {
+            await launchUrl(Uri.parse(url), mode: LaunchMode.platformDefault);
+          } catch (_) {
+            await launchUrl(Uri.parse(url));
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_paymentSuccess) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('Payment Successful'),
+          backgroundColor: const Color(0xFF2E7D32),
+        ),
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.check_circle, color: Colors.green, size: 80),
+              const SizedBox(height: 16),
+              Text('You bought ' + widget.coins.toString() + ' coins!',
+                  style: const TextStyle(
+                      fontSize: 20, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              Text('Reference: ' + _reference,
+                  style: const TextStyle(color: Colors.grey, fontSize: 12)),
+              const SizedBox(height: 24),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF2E7D32),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 32, vertical: 12),
+                ),
+                onPressed: () {
+                  Navigator.pop(context, true);
+                },
+                child: const Text('Return to Wallet'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Paystack Checkout'),
+        backgroundColor: const Color(0xFF2E7D32),
+      ),
+      body: WebViewWidget(controller: _controller),
+    );
+  }
+}
+
 class ConferenceScreen extends StatefulWidget {
   const ConferenceScreen({super.key});
   @override
@@ -104,6 +530,17 @@ class _ConferenceScreenState extends State<ConferenceScreen> {
   int liveViewerCount = 0;
 
   int bottomTab = 0;
+  String userName = "Guest";
+
+  final FirebaseFirestore firestore = FirebaseFirestore.instance;
+  final LiveKitService livekitService = LiveKitService();
+
+  // ==================== MONEY SYSTEM ====================
+  int coinBalance = 0;         // bought with real money
+  int giftEarnings = 0;        // received from gifts
+  List<Map<String, dynamic>> transactions = [];
+
+  final TextEditingController firestoreChatController = TextEditingController();
   final bibleController = TextEditingController();
   String bibleResult = "";
   final quranController = TextEditingController();
@@ -142,6 +579,11 @@ class _ConferenceScreenState extends State<ConferenceScreen> {
   @override
   void initState() {
     super.initState();
+    _loadUserName();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await livekitService.connect(userName);
+      if (mounted) setState(() {});
+    });
     Timer.periodic(const Duration(seconds: 60), (t) {
       if (!mounted) return;
       setState(() {
@@ -213,6 +655,14 @@ class _ConferenceScreenState extends State<ConferenceScreen> {
   Widget _topArea() {
     return Column(
       children: [
+        Container(
+          color: Colors.red,
+          padding: const EdgeInsets.all(6),
+          child: Text(
+            'STATUS: ' + livekitService.connectionStatus,
+            style: const TextStyle(color: Colors.white, fontSize: 11),
+          ),
+        ),
         _topBar(),
         Expanded(child: _videoGrid()),
         _toolbar(),
@@ -303,71 +753,140 @@ class _ConferenceScreenState extends State<ConferenceScreen> {
   }
 
   Widget _videoGrid() {
-    final names = [
-      'You',
-      'Pastor James',
-      'Student Aisha',
-      'Sister Grace',
-      'Bro John',
-      'Sis Mary'
-    ];
+    final room = livekitService.room;
+    final localPart = room?.localParticipant;
+    final remoteParts = room?.remoteParticipants.values.toList() ?? [];
+
+    final tiles = <Widget>[];
+
+    // First tile: YOU
+    tiles.add(_buildVideoTile(
+      name: userName.isEmpty ? 'You' : userName,
+      isLocal: true,
+      participant: localPart,
+      color: Colors.green.shade200,
+    ));
+
+    // Remote participants
+    final names = ['Pastor James', 'Student Aisha', 'Sister Grace', 'Bro John', 'Sis Mary'];
     final colors = [
-      Colors.green.shade200,
       Colors.blue.shade200,
       Colors.orange.shade200,
       Colors.purple.shade200,
       Colors.teal.shade200,
       Colors.pink.shade200,
     ];
+    for (int i = 0; i < 5; i++) {
+      if (i < remoteParts.length) {
+        tiles.add(_buildVideoTile(
+          name: remoteParts[i].identity,
+          isLocal: false,
+          participant: remoteParts[i],
+          color: colors[i],
+        ));
+      } else {
+        tiles.add(_buildEmptyTile(names[i], colors[i]));
+      }
+    }
+
     return Container(
       color: Colors.black,
       padding: const EdgeInsets.all(4),
-      child: GridView.builder(
+      child: GridView.count(
         physics: const NeverScrollableScrollPhysics(),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 3,
-          childAspectRatio: 1.0,
-          crossAxisSpacing: 4,
-          mainAxisSpacing: 4,
-        ),
-        itemCount: 6,
-        itemBuilder: (c, i) {
-          return Container(
-            decoration: BoxDecoration(
-              color: colors[i],
-              borderRadius: BorderRadius.circular(6),
-            ),
-            child: Stack(children: [
-              Center(
-                child: Text(names[i],
-                    style: const TextStyle(
-                        fontSize: 10, fontWeight: FontWeight.bold)),
-              ),
-              Positioned(
-                bottom: 3,
-                right: 3,
-                child: Row(children: [
-                  Icon(i == 0 && !micOn ? Icons.mic_off : Icons.mic,
-                      size: 12, color: Colors.white),
-                  const SizedBox(width: 3),
-                  Icon(
-                      i == 0 && !camOn
-                          ? Icons.videocam_off
-                          : Icons.videocam,
-                      size: 12,
-                      color: Colors.white),
-                ]),
-              ),
-              if (isRecording)
-                const Positioned(
-                  top: 3,
-                  right: 3,
-                  child: Icon(Icons.fiber_manual_record,
-                      color: Colors.red, size: 12),
+        crossAxisCount: 3,
+        childAspectRatio: 1.0,
+        crossAxisSpacing: 4,
+        mainAxisSpacing: 4,
+        children: tiles,
+      ),
+    );
+  }
+
+  Widget _buildVideoTile({
+    required String name,
+    required bool isLocal,
+    required lk.Participant? participant,
+    required Color color,
+  }) {
+    final hasVideo = participant != null && participant.videoTrackPublications.isNotEmpty;
+    return Container(
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Stack(
+        children: [
+          if (hasVideo)
+            Positioned.fill(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: lk.VideoTrackRenderer(
+                  participant!.videoTrackPublications.first.track as lk.VideoTrack,
                 ),
+              ),
+            )
+          else
+            Center(
+              child: Text(
+                name,
+                style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold),
+              ),
+            ),
+          Positioned(
+            bottom: 3,
+            left: 3,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+              decoration: BoxDecoration(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: Text(
+                name,
+                style: const TextStyle(fontSize: 9, color: Colors.white),
+              ),
+            ),
+          ),
+          Positioned(
+            bottom: 3,
+            right: 3,
+            child: Row(children: [
+              Icon(
+                isLocal && !micOn ? Icons.mic_off : Icons.mic,
+                size: 12,
+                color: Colors.white,
+              ),
+              const SizedBox(width: 3),
+              Icon(
+                isLocal && !camOn ? Icons.videocam_off : Icons.videocam,
+                size: 12,
+                color: Colors.white,
+              ),
             ]),
-          );
-        },
+          ),
+          if (isRecording)
+            const Positioned(
+              top: 3,
+              right: 3,
+              child: Icon(Icons.fiber_manual_record, color: Colors.red, size: 12),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmptyTile(String name, Color color) {
+    return Container(
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Center(
+        child: Text(
+          name,
+          style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold),
+        ),
       ),
     );
   }
@@ -379,10 +898,22 @@ class _ConferenceScreenState extends State<ConferenceScreen> {
       child: SingleChildScrollView(
         scrollDirection: Axis.horizontal,
         child: Row(children: [
-          _tbtn(micOn ? Icons.mic : Icons.mic_off, 'Mic',
-              () => setState(() => micOn = !micOn)),
-          _tbtn(camOn ? Icons.videocam : Icons.videocam_off, 'Cam',
-              () => setState(() => camOn = !camOn)),
+          _tbtn(micOn ? Icons.mic : Icons.mic_off, 'Mic', () async {
+            final newState = !micOn;
+            setState(() => micOn = newState);
+            try {
+              await livekitService.room?.localParticipant
+                  ?.setMicrophoneEnabled(newState);
+            } catch (_) {}
+          }),
+          _tbtn(camOn ? Icons.videocam : Icons.videocam_off, 'Cam', () async {
+            final newState = !camOn;
+            setState(() => camOn = newState);
+            try {
+              await livekitService.room?.localParticipant
+                  ?.setCameraEnabled(newState);
+            } catch (_) {}
+          }),
           _tbtn(Icons.screen_share, 'Share',
               () => setState(() => screenShareOn = !screenShareOn)),
           _tbtn(Icons.grid_view, 'Split',
@@ -505,6 +1036,45 @@ class _ConferenceScreenState extends State<ConferenceScreen> {
   }
 
   // ---------- Live Chat ----------
+
+
+  Future<void> _loadUserName() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString('userName');
+    if (saved != null && saved.isNotEmpty) {
+      setState(() => userName = saved);
+    } else {
+      _showNamePrompt();
+    }
+  }
+
+  void _showNamePrompt() {
+    final ctrl = TextEditingController();
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Welcome to All Connect'),
+        content: TextField(
+          controller: ctrl,
+          decoration: const InputDecoration(hintText: 'Enter your name'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () async {
+              final name = ctrl.text.trim().isEmpty ? 'Guest' : ctrl.text.trim();
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString('userName', name);
+              setState(() => userName = name);
+              if (ctx.mounted) Navigator.pop(ctx);
+            },
+            child: const Text('Continue'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildLiveChat() {
     return Padding(
       padding: const EdgeInsets.all(8),
@@ -512,42 +1082,46 @@ class _ConferenceScreenState extends State<ConferenceScreen> {
         children: [
           Row(
             children: [
-              const Text('Chat privately to: ',
-                  style: TextStyle(fontSize: 12)),
+              const Text('Chat privately to: ', style: TextStyle(fontSize: 12)),
               DropdownButton<String>(
                 value: privateChatTarget,
                 items: const ['Everyone', 'Pastor James', 'Student Aisha', 'Sister Grace']
-                    .map((e) => DropdownMenuItem(
-                        value: e,
-                        child: Text(e, style: TextStyle(fontSize: 12))))
+                    .map((e) => DropdownMenuItem(value: e, child: Text(e, style: TextStyle(fontSize: 12))))
                     .toList(),
                 onChanged: (v) => setState(() => privateChatTarget = v!),
               ),
             ],
           ),
           Expanded(
-            child: ListView.builder(
-              itemCount: chatMessages.length,
-              itemBuilder: (ctx, i) => Padding(
-                padding: const EdgeInsets.symmetric(vertical: 2),
-                child: Text(
-                    '${chatMessages[i]['user']}: ${chatMessages[i]['msg']}',
-                    style: const TextStyle(fontSize: 12)),
-              ),
+            child: StreamBuilder<QuerySnapshot>(
+              stream: firestore.collection('messages').orderBy('time').snapshots(),
+              builder: (context, snapshot) {
+                if (!snapshot.hasData) return const Center(child: Text('Loading chat...'));
+                final docs = snapshot.data!.docs;
+                if (docs.isEmpty) return const Center(child: Text('No messages yet. Say hi!'));
+                return ListView.builder(
+                  itemCount: docs.length,
+                  itemBuilder: (context, i) {
+                    final d = docs[i].data() as Map<String, dynamic>;
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2),
+                      child: Text((d['user'] ?? '?') + ': ' + (d['msg'] ?? ''), style: const TextStyle(fontSize: 12)),
+                    );
+                  },
+                );
+              },
             ),
           ),
           TextField(
-            controller: publicChatController,
-            decoration: const InputDecoration(
-              hintText: 'Type to everyone...',
-              isDense: true,
-              border: OutlineInputBorder(),
-            ),
-            onSubmitted: (v) {
+            controller: firestoreChatController,
+            decoration: const InputDecoration(hintText: 'Type to everyone...', isDense: true, border: OutlineInputBorder()),
+            onSubmitted: (v) async {
               if (v.trim().isEmpty) return;
-              setState(() {
-                chatMessages.add({'user': 'You', 'msg': v});
-                publicChatController.clear();
+              firestoreChatController.clear();
+              await firestore.collection('messages').add({
+                'user': userName,
+                'msg': v.trim(),
+                'time': FieldValue.serverTimestamp(),
               });
             },
           ),
@@ -555,8 +1129,6 @@ class _ConferenceScreenState extends State<ConferenceScreen> {
       ),
     );
   }
-
-  // ---------- Emojis ----------
   Widget _buildEmojis() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(8),
@@ -687,60 +1259,225 @@ class _ConferenceScreenState extends State<ConferenceScreen> {
   // ---------- Wallet ----------
   Widget _buildWallet() {
     return SingleChildScrollView(
-      padding: const EdgeInsets.all(8),
+      padding: const EdgeInsets.all(12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _walletRow('User ID', 'AC-USER-123'),
-          _walletRow('Name', 'Amabioshiogwe'),
-          _walletRow('Phone', '+234 800 000 0000'),
-          _walletRow('Email', 'user@allconnect.app'),
-          _walletRow('Role', 'Church Host'),
-          _walletRow('NIN', 'Not verified'),
-          const Divider(),
-          _walletRow('Referral Code', 'AC-JOHN123'),
-          _walletRow('Referred By', 'None'),
-          _walletRow('Total Minutes', '$totalMinutes mins'),
-          _walletRow(
-              'Wallet Balance', '$walletBalance pts = N${walletBalance * 2}'),
-          const Divider(),
-          const Text('Points History',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-          ListTile(
-            dense: true,
-            title: Text('$meetingId - $meetingType'),
-            subtitle: Text('$totalMinutes mins = $totalMinutes pts'),
+          // ============ COIN BALANCE (big, top) ============
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                colors: [Color(0xFF2E7D32), Color(0xFF66BB6A)],
+              ),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Coins Balance',
+                    style: TextStyle(color: Colors.white70, fontSize: 12)),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    const Icon(Icons.monetization_on,
+                        color: Color(0xFFFFC107), size: 28),
+                    const SizedBox(width: 8),
+                    Text('$coinBalance',
+                        style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 32,
+                            fontWeight: FontWeight.bold)),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFFFFC107),
+                      foregroundColor: Colors.black,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                    ),
+                    onPressed: () async {
+                      await Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => CoinsStoreScreen(
+                            onCoinsPurchased: (amount) {
+                              setState(() {
+                                coinBalance += amount;
+                                transactions.insert(0, {
+                                  'type': 'Bought \${amount} coins',
+                                  'amount': 'N\${amount * 5}',
+                                });
+                              });
+                            },
+                          ),
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.add_shopping_cart),
+                    label: const Text('Buy Coins'),
+                  ),
+                ),
+              ],
+            ),
           ),
-          const Divider(),
-          const Text('Referrals',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-          const ListTile(
-            dense: true,
-            title: Text('3 friends joined'),
-            subtitle: Text('1500 pts earned'),
-          ),
-          const Divider(),
+          const SizedBox(height: 16),
+
+          // ============ EARNINGS SUMMARY ============
+          const Text('Earnings',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
           const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                children: [
+                  _walletRow('Minutes Earned', '$totalMinutes mins'),
+                  _walletRow('Points Earned', '$walletBalance pts'),
+                  _walletRow('Gift Earnings', '$giftEarnings pts'),
+                  const Divider(),
+                  _walletRow('Total Naira Value',
+                      'N${(walletBalance * 2 + giftEarnings * 2).toStringAsFixed(0)}'),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // ============ USER PROFILE ============
+          const Text('Profile',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                children: [
+                  _walletRow('User ID', 'AC-USER-123'),
+                  _walletRow('Name', userName.isEmpty ? 'Guest' : userName),
+                  _walletRow('Phone', '+234 800 000 0000'),
+                  _walletRow('Email', 'user@allconnect.app'),
+                  _walletRow('Role', 'Church Host'),
+                  _walletRow('NIN', 'Not verified'),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // ============ REFERRAL ============
+          const Text('Referral',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                children: [
+                  _walletRow('Referral Code', 'AC-JOHN123'),
+                  _walletRow('Referred By', 'None'),
+                  _walletRow('Friends Joined', '3'),
+                  _walletRow('Referral Bonus', '1500 pts'),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // ============ TRANSACTION HISTORY ============
+          const Text('Transaction History',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: transactions.isEmpty
+                  ? const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 12),
+                      child: Text('No transactions yet',
+                          style: TextStyle(color: Colors.grey, fontSize: 12)),
+                    )
+                  : Column(
+                      children: transactions
+                          .map((t) => _walletRow(
+                              (t['type'] ?? 'tx').toString(),
+                              (t['amount'] ?? '0').toString()))
+                          .toList(),
+                    ),
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // ============ WITHDRAW BUTTON ============
           SizedBox(
             width: double.infinity,
             child: ElevatedButton.icon(
               style: ElevatedButton.styleFrom(
                 backgroundColor: const Color(0xFF2E7D32),
                 foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(vertical: 12),
+                padding: const EdgeInsets.symmetric(vertical: 14),
               ),
-              icon: const Icon(Icons.account_balance),
-              label: const Text('Withdraw to Bank'),
               onPressed: () {
                 ScaffoldMessenger.of(context).showSnackBar(
                   SnackBar(
                       content: Text(
-                          'Withdrawal requested - N${walletBalance * 2}')),
+                          'Withdrawal of N${(walletBalance * 2 + giftEarnings * 2).toStringAsFixed(0)} requested')),
                 );
               },
+              icon: const Icon(Icons.account_balance),
+              label: const Text('Withdraw to Bank'),
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 24),
+
+          // Poll for pending payment
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () async {
+                if (_lastPaystackRef.isEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('No payment reference. Buy coins first.')),
+                  );
+                  return;
+                }
+                try {
+                  final r = await http.get(
+                    Uri.parse('https://allconnect-token-server.onrender.com/paystack/verify/' + _lastPaystackRef),
+                  ).timeout(const Duration(seconds: 60));
+                  final data = conv.json.decode(r.body);
+                  if (data['verified'] == true) {
+                    setState(() {
+                      coinBalance += 100;
+                      transactions.insert(0, {
+                        'type': 'Verified payment',
+                        'amount': _lastPaystackRef,
+                      });
+                    });
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Payment verified! Coins added.')),
+                    );
+                  } else {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Not verified yet: ' + r.body)),
+                    );
+                  }
+                } catch (e) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Error: ' + e.toString())),
+                  );
+                }
+              },
+              icon: const Icon(Icons.refresh),
+              label: const Text('Check Payment Status'),
+            ),
+          ),
+
+          const SizedBox(height: 8),
         ],
       ),
     );
