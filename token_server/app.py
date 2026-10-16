@@ -68,9 +68,10 @@ def paystack_init():
         )
         result = r.json()
         if result.get("status"):
+            actual_ref = result["data"].get("reference", reference)
             return jsonify({
                 "checkout_url": result["data"]["authorization_url"],
-                "reference": reference,
+                "reference": actual_ref,
             })
         return jsonify({"error": result.get("message", "Paystack error")}), 400
     except Exception as e:
